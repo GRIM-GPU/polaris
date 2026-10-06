@@ -1,0 +1,653 @@
+openapi: 3.0.3
+info:
+  title: gpu-adapter API
+  version: 0.0.2
+  description: |
+    gpu-adapter는 GPU 노드에 장착된 GPU를 조회하고, MIG나 time-slicing으로 나누고, 지정한 GPU로 컨테이너 워크로드와 VM을 실행하는 REST API 서버입니다.
+
+    컨테이너 워크로드의 생성과 시작은 Kubernetes 자원을 만든 직후에, VM의 생성과 시작은 GPU 할당 준비를 마치고 VM 자원을 만든 뒤에 응답합니다. 삭제와 VM 중지는 Kubernetes 자원을 지우거나 바꾼 직후에 응답합니다. adapter는 Kubernetes 자원의 상태 변화를 기다리지 않으므로, 실행 여부와 GPU 반납은 상세 조회의 상태로 확인합니다. GPU나 이전 자원이 아직 정리되지 않아 처리할 수 없는 요청은 오류로 응답하니, 정리된 뒤 다시 요청합니다.
+security:
+  - bearerAuth: []
+tags:
+  - name: gpu
+    x-displayName: GPU
+  - name: partition
+    x-displayName: GPU 분할
+  - name: container
+    x-displayName: 컨테이너 워크로드
+  - name: vm
+    x-displayName: VM
+  - name: volume
+    x-displayName: 볼륨
+  - name: health
+    x-displayName: 상태 확인
+paths:
+  /healthz:
+    get:
+      tags: [health]
+      summary: 프로세스 상태
+      operationId: healthz
+      security: []
+      responses:
+        '200':
+          description: 프로세스가 살아 있음
+  /v1/gpus:
+    get:
+      tags: [gpu]
+      summary: GPU 목록
+      operationId: listGpus
+      responses:
+        '200':
+          description: 모든 GPU
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: '#/components/schemas/Gpu'}
+        '400': {$ref: '#/components/responses/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+  /v1/gpus/{gpuRef}:
+    get:
+      tags: [gpu]
+      summary: GPU 조회
+      operationId: getGpu
+      parameters: [{$ref: '#/components/parameters/gpuRef'}]
+      responses:
+        '200': {$ref: '#/components/responses/Gpu'}
+        '400': {$ref: '#/components/responses/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+  /v1/gpus/{gpuRef}/partition:
+    post:
+      tags: [partition]
+      summary: GPU 분할 변경
+      description: |
+        분할 방식을 바꾸거나 MIG 인스턴스를 만들고 지웁니다. 누가 쓰고 있는 GPU나 인스턴스는 `force` 없이는 바꿀 수 없습니다.
+        MIG를 바꾸면 DRA 드라이버가 새 장치를 게시하기 전에 응답하므로, 새 인스턴스를 쓰는 워크로드는 게시될 때까지 `PENDING`입니다.
+        VM에 할당된 GPU를 `force`로 바꾸면 VM을 `SUSPENDED`(사유 `DEVICE_REMOVED`)로 멈추고 `DEVICE_BUSY`로 응답합니다. GPU가 호스트로 돌아온 뒤 다시 요청합니다.
+      operationId: changePartition
+      parameters: [{$ref: '#/components/parameters/gpuRef'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/PartitionRequest'}
+            examples:
+              enableMig:
+                summary: MIG를 켜고 인스턴스 두 개 만들기
+                value: {mode: MIG, create: [1g.24gb, 2g.48gb]}
+              replaceInstance:
+                summary: MIG 인스턴스 하나 바꾸기
+                value: {mode: MIG, delete: [MIG-8bff012f-c376-5da0-a71d-e331de1bf911], create: [1g.24gb]}
+              timeSlicing:
+                summary: 사용 중인 GPU를 force로 TIME_SLICING 변경
+                value: {mode: TIME_SLICING, force: true}
+      responses:
+        '200': {$ref: '#/components/responses/Gpu'}
+        '400': {$ref: '#/components/responses/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+
+  /v1/containers:
+    post:
+      tags: [container]
+      summary: 컨테이너 워크로드 생성
+      description: |
+        지정한 GPU로 컨테이너 워크로드를 만듭니다. `gpus` 항목의 `mode`가 GPU의 현재 분할 방식과 다르면 `DEVICE_UNAVAILABLE`입니다.
+      operationId: createContainer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ContainerCreateRequest'}
+            examples:
+              service:
+                summary: MIG 인스턴스 하나를 쓰는 서비스
+                value:
+                  namespace: ml-serving
+                  name: qwen-chat
+                  kind: service
+                  gpus: [{mode: MIG, instanceId: MIG-6ea177d1-ef48-5073-bc56-cf5452f4c8e7}]
+                  image: vllm/vllm-openai:v0.10.2
+                  args: [--model, /models/qwen, --gpu-memory-utilization, '0.9']
+                  cpuMillicores: 4000
+                  memoryBytes: 34359738368
+                  volumes: [{name: models, mountPath: /models}]
+                  env: [{name: HF_TOKEN, value: hf_xxxx}]
+                  ports: [8000]
+              job:
+                summary: GPU 메모리 8GiB를 쓰는 job
+                value:
+                  namespace: ml-batch
+                  name: nightly-eval
+                  kind: job
+                  gpus: [{mode: TIME_SLICING, gpuId: GPU-ee8b1ffe-0a87-87d1-5f01-86b4cac27607, gpuMemoryBytes: 8589934592}]
+                  image: pytorch/pytorch:2.7.1-cuda12.8-cudnn9-runtime
+                  command: [python, eval.py]
+                  cpuMillicores: 2000
+                  memoryBytes: 8589934592
+      responses:
+        '201': {$ref: '#/components/responses/Container'}
+        '400': {$ref: '#/components/responses/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+    get:
+      tags: [container]
+      summary: 컨테이너 워크로드 목록
+      operationId: listContainers
+      parameters: [{$ref: '#/components/parameters/namespaceQuery'}, {$ref: '#/components/parameters/stateQuery'}]
+      responses:
+        '200':
+          description: 컨테이너 워크로드 목록
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: '#/components/schemas/Container'}
+        '400': {$ref: '#/components/responses/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+  /v1/containers/{namespace}/{name}:
+    get:
+      tags: [container]
+      summary: 컨테이너 워크로드 상세
+      operationId: getContainer
+      parameters: [{$ref: '#/components/parameters/namespace'}, {$ref: '#/components/parameters/name'}]
+      responses:
+        '200': {$ref: '#/components/responses/Container'}
+        '400': {$ref: '#/components/responses/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+    delete:
+      tags: [container]
+      summary: 컨테이너 워크로드 삭제
+      operationId: deleteContainer
+      parameters: [{$ref: '#/components/parameters/namespace'}, {$ref: '#/components/parameters/name'}]
+      responses:
+        '204': {description: 삭제됨}
+        '400': {$ref: '#/components/responses/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+  /v1/containers/{namespace}/{name}/start:
+    post:
+      tags: [container]
+      summary: 컨테이너 워크로드 시작
+      description: '`SUSPENDED` 워크로드를 지정한 GPU로 다시 시작합니다. 이전 GPU claim이 아직 지워지는 중이면 `INVALID_STATE`입니다.'
+      operationId: startContainer
+      parameters: [{$ref: '#/components/parameters/namespace'}, {$ref: '#/components/parameters/name'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ContainerStartRequest'}
+      responses:
+        '200': {$ref: '#/components/responses/Container'}
+        '400': {$ref: '#/components/responses/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+
+  /v1/vms:
+    post:
+      tags: [vm]
+      summary: VM 생성
+      description: |
+        `FULL` GPU를 할당한 VM을 만듭니다. 다른 워크로드가 쓰는 GPU면 `DEVICE_BUSY`입니다.
+      operationId: createVm
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/VmCreateRequest'}
+            example:
+              namespace: dev
+              name: ubuntu-gpu
+              gpus: ['0000:18:00.0']
+              image: quay.io/containerdisks/ubuntu:24.04
+              cpuMillicores: 4000
+              memoryBytes: 17179869184
+              userData: "#cloud-config\nssh_authorized_keys:\n  - ssh-ed25519 AAAA... user@host\n"
+              volumes: [{name: data}]
+              ports: [22]
+      responses:
+        '201': {$ref: '#/components/responses/Vm'}
+        '400': {$ref: '#/components/responses/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+    get:
+      tags: [vm]
+      summary: VM 목록
+      operationId: listVms
+      parameters: [{$ref: '#/components/parameters/namespaceQuery'}, {$ref: '#/components/parameters/stateQuery'}]
+      responses:
+        '200':
+          description: VM 목록
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: '#/components/schemas/Vm'}
+        '400': {$ref: '#/components/responses/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+  /v1/vms/{namespace}/{name}:
+    get:
+      tags: [vm]
+      summary: VM 상세
+      operationId: getVm
+      parameters: [{$ref: '#/components/parameters/namespace'}, {$ref: '#/components/parameters/name'}]
+      responses:
+        '200': {$ref: '#/components/responses/Vm'}
+        '400': {$ref: '#/components/responses/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+    patch:
+      tags: [vm]
+      summary: VM 수정
+      description: '`SUSPENDED` VM에 할당할 GPU를 바꿉니다. GPU 조건은 생성 때와 같고, 바꾼 GPU는 다음 start에 할당됩니다. 다른 상태면 `INVALID_STATE`입니다.'
+      operationId: updateVm
+      parameters: [{$ref: '#/components/parameters/namespace'}, {$ref: '#/components/parameters/name'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/VmUpdateRequest'}
+            example: {gpus: ['0000:18:00.0']}
+      responses:
+        '200': {$ref: '#/components/responses/Vm'}
+        '400': {$ref: '#/components/responses/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+    delete:
+      tags: [vm]
+      summary: VM 삭제
+      operationId: deleteVm
+      parameters: [{$ref: '#/components/parameters/namespace'}, {$ref: '#/components/parameters/name'}]
+      responses:
+        '204': {description: 삭제됨}
+        '400': {$ref: '#/components/responses/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+  /v1/vms/{namespace}/{name}/stop:
+    post:
+      tags: [vm]
+      summary: VM 중지
+      description: '`PENDING`, `RUNNING`, `FAILED` 상태의 VM을 중지하고 GPU를 반납합니다. 중지 후 상태는 `SUSPENDED`입니다. GPU가 호스트로 돌아오기를 기다리지 않고 응답합니다.'
+      operationId: stopVm
+      parameters: [{$ref: '#/components/parameters/namespace'}, {$ref: '#/components/parameters/name'}]
+      responses:
+        '200': {$ref: '#/components/responses/Vm'}
+        '400': {$ref: '#/components/responses/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+  /v1/vms/{namespace}/{name}/start:
+    post:
+      tags: [vm]
+      summary: VM 시작
+      description: '`SUSPENDED` VM을 생성이나 수정 때 지정한 GPU로 시작합니다. 조건은 생성 때와 같습니다. 이전 GPU claim이 아직 지워지는 중이면 `INVALID_STATE`입니다.'
+      operationId: startVm
+      parameters: [{$ref: '#/components/parameters/namespace'}, {$ref: '#/components/parameters/name'}]
+      responses:
+        '200': {$ref: '#/components/responses/Vm'}
+        '400': {$ref: '#/components/responses/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+
+  /v1/volumes:
+    post:
+      tags: [volume]
+      summary: 볼륨 생성
+      description: 워크로드와 별개로 유지되는 저장 공간을 만듭니다. 생성 직후 워크로드에 연결할 수 있습니다.
+      operationId: createVolume
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Volume'}
+      responses:
+        '201':
+          description: 만든 볼륨
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Volume'}
+        '400': {$ref: '#/components/responses/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+    get:
+      tags: [volume]
+      summary: 볼륨 목록
+      operationId: listVolumes
+      parameters: [{$ref: '#/components/parameters/namespaceQuery'}]
+      responses:
+        '200':
+          description: 볼륨 목록
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: '#/components/schemas/Volume'}
+        '400': {$ref: '#/components/responses/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+  /v1/volumes/{namespace}/{name}:
+    delete:
+      tags: [volume]
+      summary: 볼륨 삭제
+      description: 사용 중인 워크로드가 있으면 `INVALID_STATE`입니다.
+      operationId: deleteVolume
+      parameters: [{$ref: '#/components/parameters/namespace'}, {$ref: '#/components/parameters/name'}]
+      responses:
+        '204': {description: 삭제됨}
+        '400': {$ref: '#/components/responses/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: 사전 협의한 Bearer 토큰을 `Authorization` 헤더에 넣습니다. 토큰이 없거나 일치하지 않으면 HTTP 401입니다. `/healthz`는 토큰이 필요 없습니다.
+  parameters:
+    gpuRef:
+      name: gpuRef
+      in: path
+      required: true
+      description: GPU UUID(`GPU-...`)나 PCI 주소(`0000:18:00.0`). VM에 할당된 GPU는 PCI 주소로만 지정합니다.
+      schema: {type: string}
+    namespace:
+      name: namespace
+      in: path
+      required: true
+      schema: {$ref: '#/components/schemas/Namespace'}
+    name:
+      name: name
+      in: path
+      required: true
+      schema: {type: string}
+    namespaceQuery:
+      name: namespace
+      in: query
+      description: 없으면 모든 namespace
+      schema: {$ref: '#/components/schemas/Namespace'}
+    stateQuery:
+      name: state
+      in: query
+      schema: {$ref: '#/components/schemas/WorkloadState'}
+  responses:
+    Error:
+      description: 실패
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    Unauthorized:
+      description: 토큰이 없거나 일치하지 않음
+    Gpu:
+      description: GPU
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Gpu'}
+    Container:
+      description: 컨테이너 워크로드
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Container'}
+    Vm:
+      description: VM
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Vm'}
+  schemas:
+    Gpu:
+      type: object
+      required: [pciBusId, model, memoryBytes, binding, mode, migProfiles, timeSlicing, vmAttachable]
+      properties:
+        gpuId: {type: string, example: GPU-e3aca60c-e8a5-f1d3-79f5-481bdd9c8a65}
+        pciBusId: {type: string, example: '0000:06:00.0'}
+        model: {type: string, example: NVIDIA RTX PRO 6000 Blackwell Server Edition}
+        memoryBytes: {type: integer, format: int64}
+        binding:
+          type: string
+          enum: [host, vm]
+        mode: {$ref: '#/components/schemas/PartitionMode'}
+        migInstances:
+          type: array
+          items: {$ref: '#/components/schemas/MigInstance'}
+        migProfiles:
+          type: array
+          items: {$ref: '#/components/schemas/MigProfile'}
+        timeSlicing: {type: boolean}
+        vmAttachable: {type: boolean}
+      example:
+        gpuId: GPU-e3aca60c-e8a5-f1d3-79f5-481bdd9c8a65
+        pciBusId: '0000:06:00.0'
+        model: NVIDIA RTX PRO 6000 Blackwell Server Edition
+        memoryBytes: 103079215104
+        binding: host
+        mode: MIG
+        migInstances:
+          - {instanceId: MIG-6ea177d1-ef48-5073-bc56-cf5452f4c8e7, profile: 1g.24gb}
+          - {instanceId: MIG-98c50cc5-91c9-537a-958b-d9fa83969c2d, profile: 1g.24gb}
+        migProfiles:
+          - {name: 1g.24gb, memoryBytes: 25769803776}
+          - {name: 2g.48gb, memoryBytes: 51539607552}
+          - {name: 4g.96gb, memoryBytes: 103079215104}
+        timeSlicing: true
+        vmAttachable: true
+    MigInstance:
+      type: object
+      required: [instanceId, profile]
+      properties:
+        instanceId: {type: string, example: MIG-6ea177d1-ef48-5073-bc56-cf5452f4c8e7}
+        profile: {type: string, example: 1g.24gb}
+    MigProfile:
+      type: object
+      required: [name, memoryBytes]
+      properties:
+        name: {type: string, example: 1g.24gb}
+        memoryBytes: {type: integer, format: int64}
+    PartitionMode:
+      type: string
+      enum: [FULL, MIG, TIME_SLICING]
+    PartitionRequest:
+      type: object
+      required: [mode]
+      properties:
+        mode: {$ref: '#/components/schemas/PartitionMode'}
+        delete:
+          type: array
+          items: {type: string}
+        create:
+          type: array
+          items: {type: string}
+        force: {$ref: '#/components/schemas/Force'}
+    Force:
+      type: boolean
+      default: false
+    WorkloadState:
+      type: string
+      enum: [PENDING, RUNNING, SUSPENDED, COMPLETED, FAILED]
+    WorkloadStatus:
+      type: object
+      required: [state]
+      properties:
+        state: {$ref: '#/components/schemas/WorkloadState'}
+        reason:
+          type: string
+        message: {type: string}
+    WorkloadName:
+      type: string
+      pattern: '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'
+      maxLength: 50
+    Namespace:
+      type: string
+      pattern: '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'
+      maxLength: 63
+    ContainerGpu:
+      type: object
+      oneOf:
+        - {$ref: '#/components/schemas/FullGpu'}
+        - {$ref: '#/components/schemas/MigGpu'}
+        - {$ref: '#/components/schemas/TimeSlicingGpu'}
+      discriminator:
+        propertyName: mode
+        mapping:
+          FULL: '#/components/schemas/FullGpu'
+          MIG: '#/components/schemas/MigGpu'
+          TIME_SLICING: '#/components/schemas/TimeSlicingGpu'
+    FullGpu:
+      type: object
+      required: [mode, gpuId]
+      properties:
+        mode: {type: string, enum: [FULL]}
+        gpuId: {type: string}
+    MigGpu:
+      type: object
+      required: [mode, instanceId]
+      properties:
+        mode: {type: string, enum: [MIG]}
+        instanceId: {type: string}
+    TimeSlicingGpu:
+      type: object
+      required: [mode, gpuId, gpuMemoryBytes]
+      properties:
+        mode: {type: string, enum: [TIME_SLICING]}
+        gpuId: {type: string}
+        gpuMemoryBytes: {type: integer, format: int64, minimum: 1}
+    ContainerGpus:
+      type: array
+      minItems: 1
+      uniqueItems: true
+      items: {$ref: '#/components/schemas/ContainerGpu'}
+    WorkloadCommon:
+      type: object
+      required: [namespace, name, image, cpuMillicores, memoryBytes]
+      properties:
+        namespace: {$ref: '#/components/schemas/Namespace'}
+        name: {$ref: '#/components/schemas/WorkloadName'}
+        image: {type: string}
+        cpuMillicores: {type: integer, minimum: 1}
+        memoryBytes: {type: integer, format: int64, minimum: 1}
+        ports:
+          type: array
+          items: {type: integer, minimum: 1, maximum: 65535}
+    ContainerCreateRequest:
+      allOf:
+        - {$ref: '#/components/schemas/WorkloadCommon'}
+        - type: object
+          required: [kind, gpus]
+          properties:
+            imagePullAuth: {$ref: '#/components/schemas/ImagePullAuth'}
+            kind:
+              type: string
+              enum: [service, job]
+            gpus: {$ref: '#/components/schemas/ContainerGpus'}
+            command:
+              type: array
+              items: {type: string}
+            args:
+              type: array
+              items: {type: string}
+            env:
+              type: array
+              items: {$ref: '#/components/schemas/EnvVar'}
+            volumes:
+              type: array
+              items: {$ref: '#/components/schemas/ContainerVolume'}
+    ImagePullAuth:
+      type: object
+      required: [username, password]
+      properties:
+        username: {type: string}
+        password: {type: string}
+    EnvVar:
+      type: object
+      required: [name, value]
+      properties:
+        name: {type: string}
+        value: {type: string}
+    ContainerVolume:
+      type: object
+      required: [name, mountPath]
+      properties:
+        name: {type: string}
+        mountPath: {type: string}
+    ContainerStartRequest:
+      type: object
+      required: [gpus]
+      properties:
+        gpus: {$ref: '#/components/schemas/ContainerGpus'}
+    VmCreateRequest:
+      allOf:
+        - {$ref: '#/components/schemas/WorkloadCommon'}
+        - type: object
+          required: [gpus]
+          properties:
+            gpus: {$ref: '#/components/schemas/VmGpus'}
+            userData: {type: string}
+            volumes:
+              type: array
+              items: {$ref: '#/components/schemas/VmVolume'}
+    VmUpdateRequest:
+      type: object
+      required: [gpus]
+      properties:
+        gpus: {$ref: '#/components/schemas/VmGpus'}
+    VmGpus:
+      type: array
+      minItems: 1
+      uniqueItems: true
+      items: {type: string}
+    VmVolume:
+      type: object
+      required: [name]
+      properties:
+        name: {type: string}
+    Container:
+      type: object
+      required: [namespace, name, kind, status, gpus]
+      properties:
+        namespace: {$ref: '#/components/schemas/Namespace'}
+        name: {type: string}
+        kind: {type: string, enum: [service, job]}
+        status: {$ref: '#/components/schemas/WorkloadStatus'}
+        gpus:
+          type: array
+          items: {$ref: '#/components/schemas/ContainerGpu'}
+        endpoint: {type: string, example: qwen-chat.ml-serving.svc}
+      example:
+        namespace: ml-serving
+        name: qwen-chat
+        kind: service
+        status: {state: RUNNING}
+        gpus: [{mode: MIG, instanceId: MIG-6ea177d1-ef48-5073-bc56-cf5452f4c8e7}]
+        endpoint: qwen-chat.ml-serving.svc
+    Vm:
+      type: object
+      required: [namespace, name, status, gpus]
+      properties:
+        namespace: {$ref: '#/components/schemas/Namespace'}
+        name: {type: string}
+        status: {$ref: '#/components/schemas/WorkloadStatus'}
+        gpus:
+          type: array
+          items: {type: string}
+        endpoint: {type: string, example: ubuntu-gpu.dev.svc}
+      example:
+        namespace: dev
+        name: ubuntu-gpu
+        status: {state: RUNNING}
+        gpus: ['0000:18:00.0']
+        endpoint: ubuntu-gpu.dev.svc
+    Volume:
+      type: object
+      required: [namespace, name, sizeBytes]
+      properties:
+        namespace: {$ref: '#/components/schemas/Namespace'}
+        name: {$ref: '#/components/schemas/WorkloadName'}
+        sizeBytes: {type: integer, format: int64, minimum: 1}
+      example: {namespace: ml-serving, name: models, sizeBytes: 107374182400}
+    WorkloadRef:
+      type: object
+      required: [type, namespace, name]
+      properties:
+        type: {type: string, enum: [container, vm]}
+        namespace: {$ref: '#/components/schemas/Namespace'}
+        name: {type: string}
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          enum: [INVALID_SPEC, NOT_FOUND, CONFLICT, INVALID_STATE, NOT_SUPPORTED, DEVICE_UNAVAILABLE, DEVICE_BUSY, PARTITION_FAILED, KUBERNETES_ERROR, TIMEOUT]
+        message: {type: string}
+        busy: {$ref: '#/components/schemas/BusyDetail'}
+    BusyDetail:
+      type: object
+      properties:
+        workloads:
+          type: array
+          items: {$ref: '#/components/schemas/WorkloadRef'}
