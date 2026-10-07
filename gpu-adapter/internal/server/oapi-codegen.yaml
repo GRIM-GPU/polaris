@@ -1,0 +1,10 @@
+package: server
+output: api.gen.go
+generate:
+  gin-server: true
+  strict-server: true
+  models: true
+  embedded-spec: true
+output-options:
+  prefer-skip-optional-pointer: true
+  prefer-skip-optional-pointer-with-omitzero: true
